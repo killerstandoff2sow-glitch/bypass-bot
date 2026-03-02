@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import aiohttp
-import re  # ЭТО ДОБАВИТЬ
+import re
 import threading
 from flask import Flask
 import os
@@ -13,8 +13,8 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.callback_data import CallbackData
 
-# Токен бота (на GitHub замените на BOT_TOKEN)
-BOT_TOKEN = "BOT_TOKEN"
+# Токен бота (в Render добавишь в Environment Variables)
+BOT_TOKEN = "BOT_TOKEN"  # ЗДЕСЬ ТОКЕН
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -37,7 +37,7 @@ class BalanceStates(StatesGroup):
 class BypassStates(StatesGroup):
     waiting_for_link = State()
 
-# Класс для хранения данных пользователя (в реальном проекте используйте БД)
+# Класс для хранения данных пользователя
 class UserData:
     def __init__(self):
         self.users = {}
@@ -162,7 +162,6 @@ def get_confirmation_keyboard(confirm_type, value):
 async def bypass_link(url):
     api_url = "https://bypassunlock.com/api"
     
-    # Параметры запроса (возможно нужен API ключ)
     params = {
         "url": url
     }
@@ -195,26 +194,22 @@ async def cmd_start(message: types.Message):
     
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
-# Обработчик текстовых сообщений (для ссылок)
+# Обработчик текстовых сообщений
 @dp.message_handler()
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
     text = message.text
     
-    # Проверяем, есть ли активная подписка
     is_active, _ = user_data.get_subscription_status(user_id)
     
     if not is_active:
         await message.answer("🚫 У вас нет активной подписки. Купите подписку или активируйте пробный период.")
         return
     
-    # Проверяем, является ли текст ссылкой
     url_pattern = re.compile(r'https?://[^\s]+')
     if url_pattern.match(text):
-        # Отправляем сообщение о начале обработки
         processing_msg = await message.answer("⏳ Обрабатываю ссылку...")
         
-        # Обходим ссылку
         success, result = await bypass_link(text)
         
         if success:
@@ -241,12 +236,9 @@ async def process_menu_callback(callback_query: types.CallbackQuery, callback_da
         await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     
     elif action == "trial":
-        user = user_data.get_user(user_id)
-        
         if user_data.use_trial(user_id):
             await callback_query.answer("✅ Пробный период на 15 дней активирован!", show_alert=True)
             
-            # Обновляем сообщение
             user = user_data.get_user(user_id)
             is_active, end_date = user_data.get_subscription_status(user_id)
             time_left = format_subscription_time(end_date)
@@ -259,7 +251,6 @@ async def process_menu_callback(callback_query: types.CallbackQuery, callback_da
             await callback_query.answer("🚫 Пробный период уже был использован!", show_alert=True)
     
     elif action == "buy_subscription":
-        # Проверяем, активна ли подписка
         is_active, _ = user_data.get_subscription_status(user_id)
         
         if is_active:
@@ -359,13 +350,11 @@ async def process_confirmation(callback_query: types.CallbackQuery, callback_dat
         price = int(price)
         
         if user['balance'] >= price:
-            # Списываем баланс и активируем подписку
             user['balance'] -= price
             user_data.set_subscription(user_id, int(days))
             
             await callback_query.answer(f"✅ Подписка на {days} дней активирована!", show_alert=True)
             
-            # Возвращаемся в главное меню
             is_active, end_date = user_data.get_subscription_status(user_id)
             time_left = format_subscription_time(end_date)
             
@@ -378,14 +367,10 @@ async def process_confirmation(callback_query: types.CallbackQuery, callback_dat
     
     elif confirm_type == "confirm_balance":
         amount = int(value)
-        
-        # Здесь должна быть интеграция с платежной системой Telegram Stars
-        # Для примера просто добавляем баланс
         user['balance'] += amount
         
         await callback_query.answer(f"✅ Баланс пополнен на {amount}⭐!", show_alert=True)
         
-        # Возвращаемся в главное меню
         is_active, end_date = user_data.get_subscription_status(user_id)
         time_left = format_subscription_time(end_date)
         
@@ -396,7 +381,7 @@ async def process_confirmation(callback_query: types.CallbackQuery, callback_dat
     
     await callback_query.answer()
 
-# Фейковый веб-сервер, чтобы хостинг думал, что это веб-приложение
+# ВЕБ-СЕРВЕР ДЛЯ RENDER
 app = Flask(__name__)
 
 @app.route('/')
@@ -404,7 +389,7 @@ def home():
     return "Bot is running", 200
 
 def run_web():
-    port = int(os.environ.get('PORT', 8080))
+    port = 10000
     app.run(host='0.0.0.0', port=port)
 
 # Запускаем веб-сервер в отдельном потоке
