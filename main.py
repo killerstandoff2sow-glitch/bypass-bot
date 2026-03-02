@@ -13,8 +13,10 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.callback_data import CallbackData
 
-# Токен бота (в Render добавишь в Environment Variables)
-BOT_TOKEN = "BOT_TOKEN"  # ЗДЕСЬ ТОКЕН
+# Токен бота из переменных окружения
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в переменных окружения! Добавь его в Render.")
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -389,7 +391,7 @@ def home():
     return "Bot is running", 200
 
 def run_web():
-    port = 10000
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
 
 # Запускаем веб-сервер в отдельном потоке
