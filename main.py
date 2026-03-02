@@ -1,402 +1,402 @@
-import os, asyncio, datetime, sqlite3
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import LabeledPrice, PreCheckoutQuery, InlineKeyboardButton, InlineKeyboardMarkup
+import asyncio
+import logging
+import aiohttp
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.callback_data import CallbackData
+import os
 
-# Данные из настроек
-TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+# Токен бота (на GitHub замените на BOT_TOKEN)
+BOT_TOKEN = "BOT_TOKEN"
 
-# --- БАЗА ДАННЫХ ---
-def db_query(sql, params=(), fetchone=False):
-    with sqlite3.connect('users.db') as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        if fetchone: return cur.fetchone()
-        conn.commit()
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
-db_query('''CREATE TABLE IF NOT EXISTS users 
-            (id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, expire TEXT, is_owner INTEGER DEFAULT 0)''')
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-# --- КРАСИВЫЙ ИНТЕРФЕЙС ---
-def main_kb(user_id, balance, expire_date):
-    # Проверка подписки для текста
-    sub_status = "❌ Не активна"
-    if expire_date:
-        try:
-            dt = datetime.datetime.fromisoformat(expire_date)
-            if dt > datetime.datetime.now():
-                sub_status = f"✅ До {dt.strftime('%d.%m.%Y')}"
-        except: pass
+# Callback данные для кнопок
+menu_cb = CallbackData("menu", "action")
+subscription_cb = CallbackData("sub", "days", "price")
+balance_cb = CallbackData("balance", "amount")
+confirm_cb = CallbackData("confirm", "type", "value")
 
-    kb =,, # ЗАМЕНИ НА СВОЙ ТГ
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb), sub_status
+# Классы состояний
+class BalanceStates(StatesGroup):
+    waiting_for_custom_amount = State()
 
-# --- КОМАНДА /START ---
-@dp.message(Command("start"))
-async def start(message: types.Message):
-    res = db_query("SELECT balance, expire, is_owner FROM users WHERE id = ?", (message.from_user.id,), fetchone=True)
-    if not res:
-        owners = db_query("SELECT COUNT(*) FROM users WHERE is_owner = 1", fetchone=True)[0]
-        is_owner = 1 if owners == 0 else 0
-        db_query("INSERT INTO users (id, balance, is_owner) VALUES (?, 0, ?)", (message.from_user.id, is_owner))
-        balance, expire, owner_status = 0, None, is_owner
-    else:
-        balance, expire, owner_status = res
+class BypassStates(StatesGroup):
+    waiting_for_link = State()
 
-    kb, sub_text = main_kb(message.from_user.id, balance, expire)
+# Класс для хранения данных пользователя (в реальном проекте используйте БД)
+class UserData:
+    def __init__(self):
+        self.users = {}
     
-    profile_text = (
-        f"<b>👋 Добро пожаловать в Links Bypass!</b>\n\n"
-        f"👤 <b>Ваш профиль:</b>\n"
-        f"├ 🆔 <code>{message.from_user.id}</code>\n"
-        f"├ 💰 Баланс: <b>{balance} ⭐</b>\n"
-        f"└ 👑 Статус: <b>{sub_text}</b>\n\n"
-        f"<i>Пришлите ссылку, чтобы начать обход!</i>"
-    )
-    if owner_status == 1: profile_text += "\n\n🛠 <b>Вы — Создатель</b>"
+    def get_user(self, user_id):
+        if user_id not in self.users:
+            self.users[user_id] = {
+                'balance': 0,
+                'subscription_end': None,
+                'trial_used': False
+            }
+        return self.users[user_id]
     
-    await message.answer(profile_text, reply_markup=kb, parse_mode="HTML")
+    def update_balance(self, user_id, amount):
+        if user_id in self.users:
+            self.users[user_id]['balance'] += amount
+    
+    def set_subscription(self, user_id, days):
+        if user_id in self.users:
+            end_date = datetime.now() + timedelta(days=days)
+            self.users[user_id]['subscription_end'] = end_date
+    
+    def get_subscription_status(self, user_id):
+        user = self.get_user(user_id)
+        if user['subscription_end'] and user['subscription_end'] > datetime.now():
+            return True, user['subscription_end']
+        return False, None
+    
+    def use_trial(self, user_id):
+        user = self.get_user(user_id)
+        if not user['trial_used']:
+            user['trial_used'] = True
+            end_date = datetime.now() + timedelta(days=15)
+            user['subscription_end'] = end_date
+            return True
+        return False
 
-# --- ПОПОЛНЕНИЕ (КНОПКИ СУММ) ---
-@dp.callback_query(F.data == "deposit")
-async def deposit_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=,,,
-    ])
-    await call.message.edit_text("<b>💎 Пополнение баланса Stars</b>\n\nВыберите сумму или введите свою:", reply_markup=kb, parse_mode="HTML")
+# Инициализация хранилища пользователей
+user_data = UserData()
 
-@dp.callback_query(F.data.startswith("dep_"))
-async def fast_dep(call: types.CallbackQuery):
-    amount = int(call.data.split("_")[1])
-    await call.message.answer_invoice(
-        title="Пополнение Stars",
-        description=f"Зачисление {amount} звезд на баланс бота",
-        payload=f"stars_{amount}",
-        currency="XTR",
-        prices=[LabeledPrice(label="Пополнение", amount=amount)]
-    )
-    await call.answer()
+# Функция для форматирования оставшегося времени подписки
+def format_subscription_time(end_date):
+    if not end_date:
+        return "не активна"
+    
+    now = datetime.now()
+    if end_date <= now:
+        return "не активна"
+    
+    delta = end_date - now
+    hours = int(delta.total_seconds() / 3600)
+    return f"истекает через {hours} ч."
 
-# --- МАГАЗИН (ТАРИФЫ) ---
-@dp.callback_query(F.data == "shop")
-async def shop_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=,,,,
-    ])
-    await call.message.edit_text("<b>⚡ Выберите тариф подписки:</b>\n\n<i>Оплата будет списана с вашего внутреннего баланса бота.</i>", reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_purchase(call: types.CallbackQuery):
-    if call.data == "buy_back": return
-    _, days, price = call.data.split("_")
-    days, price = int(days), int(price)
-
-    user = db_query("SELECT balance FROM users WHERE id = ?", (call.from_user.id,), fetchone=True)
-    if user[0] >= price:
-        new_expire = (datetime.datetime.now() + datetime.timedelta(days=days)).isoformat()
-        db_query("UPDATE users SET balance = balance - ?, expire = ? WHERE id = ?", (price, new_expire, call.from_user.id))
-        await call.message.edit_text(f"<b>✅ Успешно!</b>\nПодписка активна на {days} дн.\nПриятного пользования! ✨", parse_mode="HTML")
+# Функция для создания клавиатуры главного меню
+def get_main_menu_keyboard(user_id):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    
+    is_active, end_date = user_data.get_subscription_status(user_id)
+    
+    if is_active:
+        keyboard.add(
+            InlineKeyboardButton("▶️ Подписка активна", callback_data=menu_cb.new(action="subscription_active"))
+        )
     else:
-        await call.answer("⚠️ Недостаточно звезд! Пополните баланс.", show_alert=True)
+        user = user_data.get_user(user_id)
+        if not user['trial_used']:
+            keyboard.add(
+                InlineKeyboardButton("🆓 Пробный период", callback_data=menu_cb.new(action="trial"))
+            )
+        else:
+            keyboard.add(
+                InlineKeyboardButton("💸 Купить подписку", callback_data=menu_cb.new(action="buy_subscription"))
+            )
+    
+    keyboard.add(
+        InlineKeyboardButton("🔥 Пополнить баланс", callback_data=menu_cb.new(action="add_balance"))
+    )
+    
+    return keyboard
 
-# --- ТЕХНИЧЕСКИЕ ЧАСТИ ---
-@dp.callback_query(F.data == "back")
-async def go_back(call: types.CallbackQuery):
-    await start(call.message)
-    await call.message.delete()
+# Функция для создания клавиатуры выбора подписки
+def get_subscription_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("7 дней (5⭐)", callback_data=subscription_cb.new(days="7", price="5")),
+        InlineKeyboardButton("14 дней (10⭐)", callback_data=subscription_cb.new(days="14", price="10")),
+        InlineKeyboardButton("31 день (17⭐)", callback_data=subscription_cb.new(days="31", price="17")),
+        InlineKeyboardButton("🏠 В меню", callback_data=menu_cb.new(action="main_menu"))
+    )
+    return keyboard
 
-@dp.pre_checkout_query()
-async def checkout(query: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(query.id, ok=True)
+# Функция для создания клавиатуры пополнения баланса
+def get_balance_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=3)
+    keyboard.add(
+        InlineKeyboardButton("10", callback_data=balance_cb.new(amount="10")),
+        InlineKeyboardButton("30", callback_data=balance_cb.new(amount="30")),
+        InlineKeyboardButton("50", callback_data=balance_cb.new(amount="50")),
+        InlineKeyboardButton("💸 Своя сумма", callback_data=balance_cb.new(amount="custom")),
+        InlineKeyboardButton("🏠 В меню", callback_data=menu_cb.new(action="main_menu"))
+    )
+    return keyboard
 
-@dp.message(F.successful_payment)
-async def pay_ok(message: types.Message):
-    amt = int(message.successful_payment.invoice_payload.split("_")[1])
-    db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (amt, message.from_user.id))
-    await message.answer(f"<b>🌟 Баланс пополнен на {amt} ⭐!</b>\nВоспользуйтесь меню /start чтобы купить подписку.", parse_mode="HTML")
+# Функция для создания клавиатуры подтверждения
+def get_confirmation_keyboard(confirm_type, value):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    
+    if confirm_type == "subscription":
+        keyboard.add(
+            InlineKeyboardButton("✅ Купить", callback_data=confirm_cb.new(type="confirm_sub", value=value)),
+            InlineKeyboardButton("🚫 Отмена", callback_data=menu_cb.new(action="main_menu"))
+        )
+    elif confirm_type == "balance":
+        keyboard.add(
+            InlineKeyboardButton(f"✅ {value}⭐", callback_data=confirm_cb.new(type="confirm_balance", value=value)),
+            InlineKeyboardButton("🚫 Отмена", callback_data=menu_cb.new(action="main_menu"))
+        )
+    
+    return keyboard
 
-# Админ-команда выдачи баланса
-@dp.message(Command("add_bal"))
-async def adm_add(message: types.Message):
-    owner = db_query("SELECT is_owner FROM users WHERE id = ?", (message.from_user.id,), fetchone=True)
-    if owner and owner[0] == 1:
-        try:
-            _, uid, val = message.text.split()
-            db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (int(val), int(uid)))
-            await message.answer(f"✅ Начислено {val} ⭐ пользователю {uid}")
-        except: pass
+# Функция для обхода ссылок через API
+async def bypass_link(url):
+    api_url = "https://bypassunlock.com/api"
+    
+    # Параметры запроса (возможно нужен API ключ)
+    params = {
+        "url": url
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return True, data.get("bypassed_url", "Не удалось получить ссылку")
+                else:
+                    return False, f"Ошибка API: {response.status}"
+    except asyncio.TimeoutError:
+        return False, "Нет ответа от сервера"
+    except Exception as e:
+        return False, f"Ошибка: {str(e)}"
 
+# Обработчик команды /start
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    user = user_data.get_user(user_id)
+    
+    is_active, end_date = user_data.get_subscription_status(user_id)
+    time_left = format_subscription_time(end_date)
+    
+    text = f"⚡ **LinkBypass**\nПодписка: **{time_left}**\nБаланс: **{user['balance']}⭐**"
+    
+    keyboard = get_main_menu_keyboard(user_id)
+    
+    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+
+# Обработчик текстовых сообщений (для ссылок)
+@dp.message_handler()
+async def handle_message(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text
+    
+    # Проверяем, есть ли активная подписка
+    is_active, _ = user_data.get_subscription_status(user_id)
+    
+    if not is_active:
+        await message.answer("🚫 У вас нет активной подписки. Купите подписку или активируйте пробный период.")
+        return
+    
+    # Проверяем, является ли текст ссылкой
+    url_pattern = re.compile(r'https?://[^\s]+')
+    if url_pattern.match(text):
+        # Отправляем сообщение о начале обработки
+        processing_msg = await message.answer("⏳ Обрабатываю ссылку...")
+        
+        # Обходим ссылку
+        success, result = await bypass_link(text)
+        
+        if success:
+            await processing_msg.edit_text(f"✅ Ответ от сервера: {result}")
+        else:
+            await processing_msg.edit_text(f"❌ {result}")
+    else:
+        await message.answer("Пожалуйста, отправьте ссылку для обхода.")
+
+# Обработчик callback-запросов
+@dp.callback_query_handler(menu_cb.filter())
+async def process_menu_callback(callback_query: types.CallbackQuery, callback_data: dict):
+    user_id = callback_query.from_user.id
+    action = callback_data['action']
+    
+    if action == "main_menu":
+        user = user_data.get_user(user_id)
+        is_active, end_date = user_data.get_subscription_status(user_id)
+        time_left = format_subscription_time(end_date)
+        
+        text = f"⚡ **LinkBypass**\nПодписка: **{time_left}**\nБаланс: **{user['balance']}⭐**"
+        keyboard = get_main_menu_keyboard(user_id)
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    elif action == "trial":
+        user = user_data.get_user(user_id)
+        
+        if user_data.use_trial(user_id):
+            await callback_query.answer("✅ Пробный период на 15 дней активирован!", show_alert=True)
+            
+            # Обновляем сообщение
+            user = user_data.get_user(user_id)
+            is_active, end_date = user_data.get_subscription_status(user_id)
+            time_left = format_subscription_time(end_date)
+            
+            text = f"⚡ **LinkBypass**\nПодписка: **{time_left}**\nБаланс: **{user['balance']}⭐**"
+            keyboard = get_main_menu_keyboard(user_id)
+            
+            await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        else:
+            await callback_query.answer("🚫 Пробный период уже был использован!", show_alert=True)
+    
+    elif action == "buy_subscription":
+        # Проверяем, активна ли подписка
+        is_active, _ = user_data.get_subscription_status(user_id)
+        
+        if is_active:
+            await callback_query.answer("🚫 Подписку нельзя купить когда она действует!", show_alert=True)
+            return
+        
+        user = user_data.get_user(user_id)
+        text = f"💸 Баланс: **{user['balance']}⭐**\nВыберите время подписки:"
+        keyboard = get_subscription_keyboard()
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    elif action == "subscription_active":
+        await callback_query.answer("Подписка активна! Отправьте ссылку для обхода.", show_alert=True)
+    
+    elif action == "add_balance":
+        user = user_data.get_user(user_id)
+        text = f"💸 Баланс: **{user['balance']}⭐**\nВыберите сколько звёзд вы хотите положить на аккаунт:\n__Комиссия на боте__"
+        keyboard = get_balance_keyboard()
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    await callback_query.answer()
+
+# Обработчик выбора подписки
+@dp.callback_query_handler(subscription_cb.filter())
+async def process_subscription_callback(callback_query: types.CallbackQuery, callback_data: dict):
+    user_id = callback_query.from_user.id
+    days = callback_data['days']
+    price = callback_data['price']
+    
+    user = user_data.get_user(user_id)
+    
+    text = f"💸 Баланс: **{user['balance']}⭐**\nВы выбрали: **{days} дней**\nЦена: **{price}⭐**\nПодтвердите покупку:"
+    keyboard = get_confirmation_keyboard("subscription", f"{days},{price}")
+    
+    await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback_query.answer()
+
+# Обработчик выбора баланса
+@dp.callback_query_handler(balance_cb.filter())
+async def process_balance_callback(callback_query: types.CallbackQuery, callback_data: dict, state: FSMContext):
+    user_id = callback_query.from_user.id
+    amount = callback_data['amount']
+    
+    user = user_data.get_user(user_id)
+    
+    if amount == "custom":
+        text = f"💸 Баланс: **{user['balance']}⭐**\nВведите сумму (мин 10):\n__Комиссия на боте__"
+        keyboard = InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🚫 Отмена", callback_data=menu_cb.new(action="main_menu"))
+        )
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await BalanceStates.waiting_for_custom_amount.set()
+    else:
+        text = f"💸 Баланс: **{user['balance']}⭐**\nПодтвердите покупку:"
+        keyboard = get_confirmation_keyboard("balance", amount)
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    await callback_query.answer()
+
+# Обработчик ввода своей суммы
+@dp.message_handler(state=BalanceStates.waiting_for_custom_amount)
+async def process_custom_amount(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    try:
+        amount = int(message.text)
+        
+        if amount < 10:
+            await message.answer("❌ Неверное значение, минимальная сумма – 10⭐")
+            return
+        
+        user = user_data.get_user(user_id)
+        text = f"💸 Баланс: **{user['balance']}⭐**\nПодтвердите покупку:"
+        keyboard = get_confirmation_keyboard("balance", str(amount))
+        
+        await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+        await state.finish()
+        
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите число")
+
+# Обработчик подтверждения
+@dp.callback_query_handler(confirm_cb.filter())
+async def process_confirmation(callback_query: types.CallbackQuery, callback_data: dict):
+    user_id = callback_query.from_user.id
+    confirm_type = callback_data['type']
+    value = callback_data['value']
+    
+    user = user_data.get_user(user_id)
+    
+    if confirm_type == "confirm_sub":
+        days, price = value.split(',')
+        price = int(price)
+        
+        if user['balance'] >= price:
+            # Списываем баланс и активируем подписку
+            user['balance'] -= price
+            user_data.set_subscription(user_id, int(days))
+            
+            await callback_query.answer(f"✅ Подписка на {days} дней активирована!", show_alert=True)
+            
+            # Возвращаемся в главное меню
+            is_active, end_date = user_data.get_subscription_status(user_id)
+            time_left = format_subscription_time(end_date)
+            
+            text = f"⚡ **LinkBypass**\nПодписка: **{time_left}**\nБаланс: **{user['balance']}⭐**"
+            keyboard = get_main_menu_keyboard(user_id)
+            
+            await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        else:
+            await callback_query.answer("❌ Недостаточно средств на балансе!", show_alert=True)
+    
+    elif confirm_type == "confirm_balance":
+        amount = int(value)
+        
+        # Здесь должна быть интеграция с платежной системой Telegram Stars
+        # Для примера просто добавляем баланс
+        user['balance'] += amount
+        
+        await callback_query.answer(f"✅ Баланс пополнен на {amount}⭐!", show_alert=True)
+        
+        # Возвращаемся в главное меню
+        is_active, end_date = user_data.get_subscription_status(user_id)
+        time_left = format_subscription_time(end_date)
+        
+        text = f"⚡ **LinkBypass**\nПодписка: **{time_left}**\nБаланс: **{user['balance']}⭐**"
+        keyboard = get_main_menu_keyboard(user_id)
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    await callback_query.answer()
+
+# Запуск бота
 async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-import os, asyncio, datetime, sqlite3
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import LabeledPrice, PreCheckoutQuery, InlineKeyboardButton, InlineKeyboardMarkup
-
-# Данные из настроек
-TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-
-# --- БАЗА ДАННЫХ ---
-def db_query(sql, params=(), fetchone=False):
-    with sqlite3.connect('users.db') as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        if fetchone: return cur.fetchone()
-        conn.commit()
-
-db_query('''CREATE TABLE IF NOT EXISTS users 
-            (id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, expire TEXT, is_owner INTEGER DEFAULT 0)''')
-
-# --- КРАСИВЫЙ ИНТЕРФЕЙС ---
-def main_kb(user_id, balance, expire_date):
-    # Проверка подписки для текста
-    sub_status = "❌ Не активна"
-    if expire_date:
-        try:
-            dt = datetime.datetime.fromisoformat(expire_date)
-            if dt > datetime.datetime.now():
-                sub_status = f"✅ До {dt.strftime('%d.%m.%Y')}"
-        except: pass
-
-    kb =,, # ЗАМЕНИ НА СВОЙ ТГ
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb), sub_status
-
-# --- КОМАНДА /START ---
-@dp.message(Command("start"))
-async def start(message: types.Message):
-    res = db_query("SELECT balance, expire, is_owner FROM users WHERE id = ?", (message.from_user.id,), fetchone=True)
-    if not res:
-        owners = db_query("SELECT COUNT(*) FROM users WHERE is_owner = 1", fetchone=True)[0]
-        is_owner = 1 if owners == 0 else 0
-        db_query("INSERT INTO users (id, balance, is_owner) VALUES (?, 0, ?)", (message.from_user.id, is_owner))
-        balance, expire, owner_status = 0, None, is_owner
-    else:
-        balance, expire, owner_status = res
-
-    kb, sub_text = main_kb(message.from_user.id, balance, expire)
-    
-    profile_text = (
-        f"<b>👋 Добро пожаловать в Links Bypass!</b>\n\n"
-        f"👤 <b>Ваш профиль:</b>\n"
-        f"├ 🆔 <code>{message.from_user.id}</code>\n"
-        f"├ 💰 Баланс: <b>{balance} ⭐</b>\n"
-        f"└ 👑 Статус: <b>{sub_text}</b>\n\n"
-        f"<i>Пришлите ссылку, чтобы начать обход!</i>"
-    )
-    if owner_status == 1: profile_text += "\n\n🛠 <b>Вы — Создатель</b>"
-    
-    await message.answer(profile_text, reply_markup=kb, parse_mode="HTML")
-
-# --- ПОПОЛНЕНИЕ (КНОПКИ СУММ) ---
-@dp.callback_query(F.data == "deposit")
-async def deposit_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=,,,
-    ])
-    await call.message.edit_text("<b>💎 Пополнение баланса Stars</b>\n\nВыберите сумму или введите свою:", reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("dep_"))
-async def fast_dep(call: types.CallbackQuery):
-    amount = int(call.data.split("_")[1])
-    await call.message.answer_invoice(
-        title="Пополнение Stars",
-        description=f"Зачисление {amount} звезд на баланс бота",
-        payload=f"stars_{amount}",
-        currency="XTR",
-        prices=[LabeledPrice(label="Пополнение", amount=amount)]
-    )
-    await call.answer()
-
-# --- МАГАЗИН (ТАРИФЫ) ---
-@dp.callback_query(F.data == "shop")
-async def shop_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=,,,,
-    ])
-    await call.message.edit_text("<b>⚡ Выберите тариф подписки:</b>\n\n<i>Оплата будет списана с вашего внутреннего баланса бота.</i>", reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_purchase(call: types.CallbackQuery):
-    if call.data == "buy_back": return
-    _, days, price = call.data.split("_")
-    days, price = int(days), int(price)
-
-    user = db_query("SELECT balance FROM users WHERE id = ?", (call.from_user.id,), fetchone=True)
-    if user[0] >= price:
-        new_expire = (datetime.datetime.now() + datetime.timedelta(days=days)).isoformat()
-        db_query("UPDATE users SET balance = balance - ?, expire = ? WHERE id = ?", (price, new_expire, call.from_user.id))
-        await call.message.edit_text(f"<b>✅ Успешно!</b>\nПодписка активна на {days} дн.\nПриятного пользования! ✨", parse_mode="HTML")
-    else:
-        await call.answer("⚠️ Недостаточно звезд! Пополните баланс.", show_alert=True)
-
-# --- ТЕХНИЧЕСКИЕ ЧАСТИ ---
-@dp.callback_query(F.data == "back")
-async def go_back(call: types.CallbackQuery):
-    await start(call.message)
-    await call.message.delete()
-
-@dp.pre_checkout_query()
-async def checkout(query: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(query.id, ok=True)
-
-@dp.message(F.successful_payment)
-async def pay_ok(message: types.Message):
-    amt = int(message.successful_payment.invoice_payload.split("_")[1])
-    db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (amt, message.from_user.id))
-    await message.answer(f"<b>🌟 Баланс пополнен на {amt} ⭐!</b>\nВоспользуйтесь меню /start чтобы купить подписку.", parse_mode="HTML")
-
-# Админ-команда выдачи баланса
-@dp.message(Command("add_bal"))
-async def adm_add(message: types.Message):
-    owner = db_query("SELECT is_owner FROM users WHERE id = ?", (message.from_user.id,), fetchone=True)
-    if owner and owner[0] == 1:
-        try:
-            _, uid, val = message.text.split()
-            db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (int(val), int(uid)))
-            await message.answer(f"✅ Начислено {val} ⭐ пользователю {uid}")
-        except: pass
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-import os, asyncio, datetime, sqlite3
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import LabeledPrice, PreCheckoutQuery, InlineKeyboardButton, InlineKeyboardMarkup
-
-# Данные из настроек
-TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-
-# --- БАЗА ДАННЫХ ---
-def db_query(sql, params=(), fetchone=False):
-    with sqlite3.connect('users.db') as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        if fetchone: return cur.fetchone()
-        conn.commit()
-
-db_query('''CREATE TABLE IF NOT EXISTS users 
-            (id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, expire TEXT, is_owner INTEGER DEFAULT 0)''')
-
-# --- КРАСИВЫЙ ИНТЕРФЕЙС ---
-def main_kb(user_id, balance, expire_date):
-    # Проверка подписки для текста
-    sub_status = "❌ Не активна"
-    if expire_date:
-        try:
-            dt = datetime.datetime.fromisoformat(expire_date)
-            if dt > datetime.datetime.now():
-                sub_status = f"✅ До {dt.strftime('%d.%m.%Y')}"
-        except: pass
-
-    kb =,, # ЗАМЕНИ НА СВОЙ ТГ
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb), sub_status
-
-# --- КОМАНДА /START ---
-@dp.message(Command("start"))
-async def start(message: types.Message):
-    res = db_query("SELECT balance, expire, is_owner FROM users WHERE id = ?", (message.from_user.id,), fetchone=True)
-    if not res:
-        owners = db_query("SELECT COUNT(*) FROM users WHERE is_owner = 1", fetchone=True)[0]
-        is_owner = 1 if owners == 0 else 0
-        db_query("INSERT INTO users (id, balance, is_owner) VALUES (?, 0, ?)", (message.from_user.id, is_owner))
-        balance, expire, owner_status = 0, None, is_owner
-    else:
-        balance, expire, owner_status = res
-
-    kb, sub_text = main_kb(message.from_user.id, balance, expire)
-    
-    profile_text = (
-        f"<b>👋 Добро пожаловать в Links Bypass!</b>\n\n"
-        f"👤 <b>Ваш профиль:</b>\n"
-        f"├ 🆔 <code>{message.from_user.id}</code>\n"
-        f"├ 💰 Баланс: <b>{balance} ⭐</b>\n"
-        f"└ 👑 Статус: <b>{sub_text}</b>\n\n"
-        f"<i>Пришлите ссылку, чтобы начать обход!</i>"
-    )
-    if owner_status == 1: profile_text += "\n\n🛠 <b>Вы — Создатель</b>"
-    
-    await message.answer(profile_text, reply_markup=kb, parse_mode="HTML")
-
-# --- ПОПОЛНЕНИЕ (КНОПКИ СУММ) ---
-@dp.callback_query(F.data == "deposit")
-async def deposit_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=,,,
-    ])
-    await call.message.edit_text("<b>💎 Пополнение баланса Stars</b>\n\nВыберите сумму или введите свою:", reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("dep_"))
-async def fast_dep(call: types.CallbackQuery):
-    amount = int(call.data.split("_")[1])
-    await call.message.answer_invoice(
-        title="Пополнение Stars",
-        description=f"Зачисление {amount} звезд на баланс бота",
-        payload=f"stars_{amount}",
-        currency="XTR",
-        prices=[LabeledPrice(label="Пополнение", amount=amount)]
-    )
-    await call.answer()
-
-# --- МАГАЗИН (ТАРИФЫ) ---
-@dp.callback_query(F.data == "shop")
-async def shop_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=,,,,
-    ])
-    await call.message.edit_text("<b>⚡ Выберите тариф подписки:</b>\n\n<i>Оплата будет списана с вашего внутреннего баланса бота.</i>", reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_purchase(call: types.CallbackQuery):
-    if call.data == "buy_back": return
-    _, days, price = call.data.split("_")
-    days, price = int(days), int(price)
-
-    user = db_query("SELECT balance FROM users WHERE id = ?", (call.from_user.id,), fetchone=True)
-    if user[0] >= price:
-        new_expire = (datetime.datetime.now() + datetime.timedelta(days=days)).isoformat()
-        db_query("UPDATE users SET balance = balance - ?, expire = ? WHERE id = ?", (price, new_expire, call.from_user.id))
-        await call.message.edit_text(f"<b>✅ Успешно!</b>\nПодписка активна на {days} дн.\nПриятного пользования! ✨", parse_mode="HTML")
-    else:
-        await call.answer("⚠️ Недостаточно звезд! Пополните баланс.", show_alert=True)
-
-# --- ТЕХНИЧЕСКИЕ ЧАСТИ ---
-@dp.callback_query(F.data == "back")
-async def go_back(call: types.CallbackQuery):
-    await start(call.message)
-    await call.message.delete()
-
-@dp.pre_checkout_query()
-async def checkout(query: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(query.id, ok=True)
-
-@dp.message(F.successful_payment)
-async def pay_ok(message: types.Message):
-    amt = int(message.successful_payment.invoice_payload.split("_")[1])
-    db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (amt, message.from_user.id))
-    await message.answer(f"<b>🌟 Баланс пополнен на {amt} ⭐!</b>\nВоспользуйтесь меню /start чтобы купить подписку.", parse_mode="HTML")
-
-# Админ-команда выдачи баланса
-@dp.message(Command("add_bal"))
-async def adm_add(message: types.Message):
-    owner = db_query("SELECT is_owner FROM users WHERE id = ?", (message.from_user.id,), fetchone=True)
-    if owner and owner[0] == 1:
-        try:
-            _, uid, val = message.text.split()
-            db_query("UPDATE users SET balance = balance + ? WHERE id = ?", (int(val), int(uid)))
-            await message.answer(f"✅ Начислено {val} ⭐ пользователю {uid}")
-        except: pass
-
-async def main():
-    await dp.start_polling(bot)
+    logging.info("Бот запущен...")
+    await dp.start_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
