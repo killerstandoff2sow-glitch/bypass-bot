@@ -1,6 +1,10 @@
 import asyncio
 import logging
 import aiohttp
+import re  # ЭТО ДОБАВИТЬ
+import threading
+from flask import Flask
+import os
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -8,7 +12,6 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.callback_data import CallbackData
-import os
 
 # Токен бота (на GitHub замените на BOT_TOKEN)
 BOT_TOKEN = "BOT_TOKEN"
@@ -392,6 +395,20 @@ async def process_confirmation(callback_query: types.CallbackQuery, callback_dat
         await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     
     await callback_query.answer()
+
+# Фейковый веб-сервер, чтобы хостинг думал, что это веб-приложение
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running", 200
+
+def run_web():
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Запускаем веб-сервер в отдельном потоке
+threading.Thread(target=run_web, daemon=True).start()
 
 # Запуск бота
 async def main():
